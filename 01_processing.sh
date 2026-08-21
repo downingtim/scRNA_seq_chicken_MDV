@@ -1,201 +1,156 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# MDV SC-RNA PIPELINE (FINAL STABLE VERSION)
-# ============================================================
+############################################
+# CONFIG
+############################################
+REF="EF523390.1.masked.fa"
+THREADS=4
 
-SAMPLES="01 02 03 04 05 06 07 08"
-SAMPLES="02"
-ANNOT="MDV.gtf"
+mkdir -p mdv_filtered
+mkdir -p viral_realign
 
-echo "======================================"
-echo "Running MDV pipeline"
-echo "======================================"
+# ✅ Input BAMs (pos-sorted)
+BAMS=(
+MDV_02.bam
+MDV_03.bam
+MDV_04.bam
+MDV_05.bam
+MDV_06.bam
+MDV_07.bam
+MDV_11.bam
+MDV_12.bam
+)
 
-for ID in $SAMPLES; do
+############################################
+# STEP 0 — CHECK + INDEX BAMS
+############################################
+echo "Checking and indexing BAMs..."
 
-    echo ""
-    echo "=============================="
-    echo "Processing sample $ID"
-    echo "=============================="
+for BAM in "${BAMS[@]}"
+do
+    echo "Checking $BAM"
 
-    BAM_IN="MDV_${ID}.bam"
-    BAM_OUT="MDV.${ID}.bam"
-    PREFIX="MDV_${ID}"
+    if [ ! -f "$BAM" ]; then
+        echo "ERROR: $BAM not found"
+        exit 1
+    fi
 
-    # --------------------------------------------------------
-    # 1. Extract viral reads
-    # --------------------------------------------------------
-    echo "[1/6] Extracting viral reads"
+    # Check integrity
+    samtools quickcheck "$BAM"
 
-    samtools index "$BAM_IN"
-
-    samtools idxstats "$BAM_IN" | cut -f1 | grep "alli" | grep -v '^\*$' > tmp.refs.txt
-    refs=$(cat tmp.refs.txt)
-
-    samtools view -b "$BAM_IN" $refs > "$BAM_OUT"
-    samtools index "$BAM_OUT"
-
-    # --------------------------------------------------------
-    # 2. Correct depth (ONLY MDV contig)
-    # --------------------------------------------------------
-    echo "[2/6] Generating depth file"
-
-    MDV_CHROM=$(head -n1 tmp.refs.txt)
-
-    echo "Using contig: $MDV_CHROM"
-
-    samtools depth -aa -r "$MDV_CHROM" "$BAM_OUT" > "${PREFIX}.depth"
-
-    echo "Depth lines:"
-    wc -l "${PREFIX}.depth"
-
-    # --------------------------------------------------------
-    # 3. Build BED with CB and UB
-    # --------------------------------------------------------
-    echo "[3/6] Extracting CB/UB"
-
-    samtools view -F 2308 "$BAM_OUT" | awk 'BEGIN{OFS="\t"}
-    {
-        chrom=$3
-        start=$4-1
-        end=start+length($10)
-
-        cb="NA"; ub="NA"
-
-        for(i=12;i<=NF;i++){
-            if($i ~ /^CB:Z:/) cb=substr($i,6)
-            if($i ~ /^UB:Z:/) ub=substr($i,6)
-        }
-
-        if(cb=="NA" || ub=="NA") next
-
-        print chrom, start, end, $1, $5, ".", cb, ub
-    }' | sort -k1,1 -k2,2n > "${PREFIX}_reads_with_CB_UB.bed"
-
-    echo "Reads with CB+UB:"
-    wc -l "${PREFIX}_reads_with_CB_UB.bed"
-
-    # --------------------------------------------------------
-    # 4. Midpoints
-    # --------------------------------------------------------
-    echo "[4/6] Creating midpoints"
-
-    awk 'BEGIN{OFS="\t"}
-    {
-        mid=int(($2+$3)/2)
-        print $1, mid, mid+1, $4, $5, $6, $7, $8
-    }' "${PREFIX}_reads_with_CB_UB.bed" \
-    > "${PREFIX}_reads_midpoints.bed"
-
-    BAM_CHROM=$(head -n1 "${PREFIX}_reads_midpoints.bed" | cut -f1)
-
-    echo "Using chromosome for genes: $BAM_CHROM"
-
-    # --------------------------------------------------------
-    # 5. Gene assignment (FIXED)
-    # --------------------------------------------------------
-    echo "[5/6] Assigning reads to genes"
-
-    awk -v chrom="$BAM_CHROM" 'BEGIN{FS=OFS="\t"}
-    $3=="gene"{
-        start=$4-1
-        gene="NA"
-
-        if(match($9,/gene_id[ ="]+([^";]+)/,a)) gene=a[1]
-        else if(match($9,/Name=([^;]+)/,a)) gene=a[1]
-        else if(match($9,/ID=([^;]+)/,a)) gene=a[1]
-
-        print chrom, start, $5, gene, ".", $7
-    }' "$ANNOT" > "${PREFIX}_genes.bed"
-
-    bedtools intersect -wa -wb \
-        -a "${PREFIX}_reads_midpoints.bed" \
-        -b "${PREFIX}_genes.bed" \
-    > "${PREFIX}_midpoints_to_genes.tsv"
-
-    echo "Gene assignments:"
-    wc -l "${PREFIX}_midpoints_to_genes.tsv"
-
-    # --------------------------------------------------------
-    # 6a. Per-cell viral reads
-    # --------------------------------------------------------
-    echo "[6/6] Calculating summaries"
-
-    awk 'BEGIN{OFS="\t"}
-    {
-        cb=$7; ub=$8
-
-        read[cb]++
-
-        key=cb OFS ub
-        if(!(key in seen)){
-            seen[key]=1
-            umi[cb]++
-        }
-    }
-    END{
-        for(cb in read){
-            print cb, read[cb], umi[cb]
-        }
-    }' "${PREFIX}_reads_with_CB_UB.bed" \
-    | sort -k2,2nr > "${PREFIX}_cell_barcode_viral_reads.tsv"
-
-    sed -i '1i cell_barcode\tn_reads\tn_unique_umis' \
-    "${PREFIX}_cell_barcode_viral_reads.tsv"
-
-    # --------------------------------------------------------
-    # 6b. Global gene expression (FINAL FIX)
-    # --------------------------------------------------------
-    awk 'BEGIN{OFS="\t"}
-    {
-        gene=$12
-        cb=$7
-        ub=$8
-
-        if(gene=="" || gene==".") next
-
-        key=gene OFS cb OFS ub
-
-        if(!(key in seen)){
-            seen[key]=1
-            gene_count[gene]++
-            total++
-        }
-    }
-    END{
-        if(total==0){
-            print "WARNING: no gene counts" > "/dev/stderr"
-        }
-
-        for(g in gene_count){
-            frac=gene_count[g]/total
-            print g, gene_count[g], frac
-        }
-    }' "${PREFIX}_midpoints_to_genes.tsv" \
-    | sort -k2,2nr > "${PREFIX}_gene_expression.tmp"
-
-    echo -e "gene_id\ttotal_UMIs\tfraction" \
-    > "${PREFIX}_gene_expression.tsv"
-
-    cat "${PREFIX}_gene_expression.tmp" \
-    >> "${PREFIX}_gene_expression.tsv"
-
-    rm -f "${PREFIX}_gene_expression.tmp"
-
-    echo "✅ Sample $ID complete"
-
+    # ✅ Ensure index exists
+    if [ ! -f "${BAM}.bai" ]; then
+        echo "Index missing → indexing $BAM"
+        samtools index "$BAM"
+    fi
 done
 
-rm -f tmp.refs.txt
+echo "All BAMs OK and indexed"
+echo "----------------------------------"
+
+############################################
+# MAIN LOOP
+############################################
+for BAM in "${BAMS[@]}"
+do
+    SAMPLE=$(basename "$BAM" .bam)
+
+    echo ""
+    echo "=================================="
+    echo "Processing $SAMPLE"
+    echo "=================================="
+
+    ############################################
+    # STEP 1 — Extract MDV reads
+    ############################################
+    echo "Extracting MDV references..."
+
+    refs=$(samtools idxstats "$BAM" | cut -f1 | grep -E 'EF' | grep -v '^\*$' || true)
+
+    if [ -z "$refs" ]; then
+        echo "WARNING: No MDV refs found for $SAMPLE → skipping"
+        continue
+    fi
+
+    echo "Found refs:"
+    echo "$refs"
+
+    samtools view -b "$BAM" $refs > mdv_filtered/${SAMPLE}.MDV.bam
+    samtools index mdv_filtered/${SAMPLE}.MDV.bam
+
+    ############################################
+    # STEP 2 — Extract CB / UB / NH tags
+    ############################################
+    echo "Extracting CB/UB/NH..."
+
+    samtools view mdv_filtered/${SAMPLE}.MDV.bam | \
+    awk '{
+        cb="NA"; ub="NA"; nh="NA";
+        for(i=12;i<=NF;i++){
+            if($i ~ /^CB:Z:/){cb=substr($i,6)}
+            if($i ~ /^UB:Z:/){ub=substr($i,6)}
+            if($i ~ /^NH:i:/){nh=substr($i,6)}
+        }
+        end=$4+length($10)-1;
+        print cb"\t"ub"\t"$3"\t"$4"\t"end"\t"nh
+    }' > mdv_filtered/${SAMPLE}.reads.tsv
+
+    ############################################
+    # STEP 3 — Summarise CB counts
+    ############################################
+    echo "Summarising CB usage..."
+
+    cut -f1,2 mdv_filtered/${SAMPLE}.reads.tsv | \
+        sort -u | \
+        cut -f1 | \
+        sort | \
+        uniq -c > mdv_filtered/${SAMPLE}_cb_counts.txt
+
+    ############################################
+    # STEP 4 — Depth calculation
+    ############################################
+    echo "Computing depth..."
+
+    samtools depth -aa mdv_filtered/${SAMPLE}.MDV.bam | \
+        grep -E 'EF' > mdv_filtered/${SAMPLE}.depth
+
+    ############################################
+    # STEP 5 — BAM → FASTQ
+    ############################################
+    echo "Generating FASTQ..."
+
+    samtools fastq mdv_filtered/${SAMPLE}.MDV.bam > mdv_filtered/${SAMPLE}.fastq
+    ls -lt  mdv_filtered/${SAMPLE}.fastq
+
+    ############################################
+    # STEP 6 — Realign to viral reference
+    ############################################
+    echo "Realigning..."
+
+    bwa mem -t ${THREADS} ${REF} \
+        mdv_filtered/${SAMPLE}.fastq \
+        > viral_realign/${SAMPLE}.sam
+
+    ############################################
+    # STEP 7 — Convert + sort + index
+    ############################################
+    samtools view -b viral_realign/${SAMPLE}.sam \
+        > viral_realign/${SAMPLE}.bam
+
+    samtools sort -o viral_realign/${SAMPLE}.sorted.bam \
+        viral_realign/${SAMPLE}.bam
+
+    samtools index viral_realign/${SAMPLE}.sorted.bam
+
+    ############################################
+    # CLEANUP (optional but recommended)
+    ############################################
+    rm viral_realign/${SAMPLE}.sam
+    rm viral_realign/${SAMPLE}.bam
+
+    echo "DONE $SAMPLE"
+done
 
 echo ""
-echo "======================================"
 echo "✅ ALL SAMPLES COMPLETE"
-echo "======================================"
-
-echo "Outputs per sample:"
-echo "  *_cell_barcode_viral_reads.tsv"
-echo "  *_gene_expression.tsv"
-echo "  *.depth (correct ~178k rows)"
